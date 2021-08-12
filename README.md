@@ -18,7 +18,7 @@ backscrub is licensed under the Apache License 2.0. See LICENSE file for details
 
 ## Building
 
-Install dependencies (`sudo apt install libopencv-dev build-essential v4l2loopback-dkms curl`).
+Install dependencies (`sudo apt install libopencv-dev build-essential v4l2loopback-dkms curl libminizip-dev`).
 
 Clone this repository with `git clone --recursive https://github.com/floe/backscrub.git`.
 To speed up the checkout you can additionally pass `--depth=1` to `git clone`.

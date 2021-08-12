@@ -2,6 +2,7 @@
  * Authors - @see AUTHORS file.
 ==============================================================================*/
 
+#include <unzip.h>
 #include "tensorflow/lite/interpreter.h"
 #include "tensorflow/lite/kernels/register.h"
 #include "tensorflow/lite/model.h"
@@ -9,6 +10,8 @@
 
 #include "transpose_conv_bias.h"
 #include "libbackscrub.h"
+
+#include "metadata_schema_generated.h"
 
 // Internal context structures
 enum class modeltype_t {
@@ -32,6 +35,10 @@ struct backscrub_ctx_t {
 	// Specific model type & input normalization
 	modeltype_t modeltype;
 	normalization_t norm;
+	// Deeplab label info for post-processing
+	std::vector<std::string> labels;
+	size_t cnum;
+	size_t pers;
 	// Optional callbacks with caller-provided context
 	void (*ondebug)(void *ctx, const char *msg);
 	void (*onprep)(void *ctx);
@@ -107,8 +114,73 @@ static cv::Mat getTensorMat(backscrub_ctx_t &ctx, int tnum) {
 	return cv::Mat(h,w,CV_32FC(c),p_data);
 }
 
-// Determine type of model from the name
-// TODO:XXX: use metadata when available
+static std::vector<std::string> read_labels(const char *modelname, const char *labelfile) {
+	std::vector<std::string> res;
+	unzFile zip = unzOpen(modelname);
+	if (!zip)
+		goto done;
+	if (UNZ_OK!=unzLocateFile(zip, labelfile, 2))
+		goto done;
+	unz_file_info info;
+	if (UNZ_OK!=unzGetCurrentFileInfo(zip, &info, nullptr, 0, nullptr, 0, nullptr, 0))
+		goto done;
+	if (UNZ_OK!=unzOpenCurrentFile(zip))
+		goto done;
+	{
+		int len = (int)info.uncompressed_size;
+		char *buf = new char[len+1];
+		if (len!=unzReadCurrentFile(zip, buf, len)) {
+			delete buf;
+			goto done;
+		}
+		buf[len]=0;
+		std::istringstream str(buf);
+		std::string s;
+		while (std::getline(str, s))
+			res.push_back(s);
+		delete buf;
+		unzCloseCurrentFile(zip);
+	}
+done:
+	if (zip)
+		unzClose(zip);
+	return res;
+}
+
+static int parse_metadata(const uint8_t *buf, const uint32_t size, float *pmean, float *pstdd, std::string *plabels) {
+	// check we have the right buffer
+	if (!tflite::ModelMetadataBufferHasIdentifier(buf))
+		return 1;
+	const tflite::ModelMetadata *md = tflite::GetModelMetadata(buf);
+	if (md->version()->str() != "v1")
+		return -1;
+	const flatbuffers::Vector<flatbuffers::Offset<tflite::SubGraphMetadata>> *subg = md->subgraph_metadata();
+	if (subg->size()!=1)
+		return -3;
+	const flatbuffers::Vector<flatbuffers::Offset<tflite::TensorMetadata>> *itmd = subg->Get(0)->input_tensor_metadata();
+	if (itmd->size()!=1)
+		return -4;
+	const flatbuffers::Vector<flatbuffers::Offset<tflite::ProcessUnit>> *pus = itmd->Get(0)->process_units();
+	if (pus->size()!=1)
+		return -5;
+	const tflite::ProcessUnit *pu = pus->Get(0);
+	if (pu->options_type()!=tflite::ProcessUnitOptions::NormalizationOptions)
+		return -6;
+	const tflite::NormalizationOptions *norm = pu->options_as_NormalizationOptions();
+	if (norm->mean()->size()!=1)
+		return -7;
+	if (norm->std()->size()!=1)
+		return -8;
+	*pmean = norm->mean()->Get(0);
+	*pstdd = norm->std()->Get(0);
+	const flatbuffers::Vector<flatbuffers::Offset<tflite::TensorMetadata>> *otmd = subg->Get(0)->output_tensor_metadata();
+	if (otmd && otmd->size()==1) {
+		*plabels = otmd->Get(0)->associated_files()->Get(0)->name()->str();
+	}
+	return 0;
+}
+
+// Determine type of model (and thus post-processing required) from file name :=(
 static modeltype_t get_modeltype(const char* modelname) {
 	if (strstr(modelname, "body-pix")) {
 		return modeltype_t::BodyPix;
@@ -126,7 +198,7 @@ static modeltype_t get_modeltype(const char* modelname) {
 }
 
 static normalization_t get_normalization(modeltype_t type) {
-	// TODO: This should be read out from actual model metadata instead
+	// Only used when model has no metadata with this in
 	normalization_t rv = {0};
 	switch (type) {
 		case modeltype_t::DeepLab:
@@ -187,11 +259,51 @@ void *bs_maskgen_new(
 	}
 	// Determine model type and normalization values
 	ctx.modeltype = get_modeltype(modelname);
-	ctx.norm = get_normalization(ctx.modeltype);
 	if (modeltype_t::Unknown == ctx.modeltype) {
 		_dbg(ctx, "error: unknown model type '%s'.\n", modelname);
 		bs_maskgen_delete(pctx);
 		return nullptr;
+	}
+	auto model = ctx.model->GetModel();
+	auto *md = model->metadata();
+	float tmpmean = 0.0, tmpstdd = 0.0;
+	std::string labfile;
+	if (md) {
+		for (uint32_t mid=0; mid < md->size(); ++mid) {
+			const auto meta = md->Get(mid);
+			_dbg(ctx, "model metadata: %s\n", meta->name()->c_str());
+			if (meta->name()->str() != "TFLITE_METADATA")
+				continue;
+			// grab raw buffer and parse it..
+			const flatbuffers::Vector<uint8_t> *pvec = model->buffers()->Get(meta->buffer())->data();
+			int rv = parse_metadata(pvec->data(), pvec->size(), &tmpmean, &tmpstdd, &labfile);
+			if (rv)
+				_dbg(ctx, "error: unable to parse TfLite metadata: %d\n", rv);
+		}
+	}
+	if (tmpstdd!=0.0) {
+		// valid metadata found
+		ctx.norm.scaling = 1/tmpstdd;
+		ctx.norm.offset = -(tmpmean/tmpstdd);
+		_dbg(ctx, "\tmetadata normalisation: scaling=%f offset=%f\n", ctx.norm.scaling, ctx.norm.offset);
+	} else {
+		// guess from model type..
+		ctx.norm = get_normalization(ctx.modeltype);
+	}
+	// Set Deeplabv3 labels from metadata or use defaults
+	ctx.labels = { "background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat", "chair", "cow", "dining table", "dog", "horse", "motorbike", "person", "potted plant", "sheep", "sofa", "train", "tv" };
+	ctx.cnum = labels.size();
+	ctx.pers = std::distance(labels.begin(), std::find(labels.begin(),labels.end(),"person"));
+	if (!labfile.empty()) {
+		std::vector<std::string> tmplabs = read_labels(modelname, labfile.c_str());
+		if (tmplabs.size() > 0) {
+			ctx.labels = tmplabs;
+			ctx.cnum = labels.size();
+			ctx.pers = std::distance(labels.begin(), std::find(labels.begin(),labels.end(),"person"));
+			for (size_t l=0; l<ctx.cnum; ++l)
+				_dbg(ctx, "\tlabel(%lu): %s\n", l, ctx.labels[l].c_str());
+			_dbg(ctx, "\tperson@%ld\n", ctx.pers);
+		}
 	}
 	// Build the interpreter
 	tflite::ops::builtin::BuiltinOpResolver resolver;
