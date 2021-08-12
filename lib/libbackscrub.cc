@@ -6,6 +6,7 @@
 #include "tensorflow/lite/kernels/register.h"
 #include "tensorflow/lite/model.h"
 #include "tensorflow/lite/optional_debug_tools.h"
+#include "tensorflow/lite/delegates/gpu/delegate.h"
 
 #include "transpose_conv_bias.h"
 #include "libbackscrub.h"
@@ -205,11 +206,24 @@ void *bs_maskgen_new(
 		return nullptr;
 	}
 
-	// Allocate tensor buffers.
-	if (ctx.interpreter->AllocateTensors() != kTfLiteOk) {
-		_dbg(ctx, "error: unable to allocate tensor buffers\n");
-		bs_maskgen_delete(pctx);
-		return nullptr;
+	// Wanna try GPU?
+	if (getenv("BACKSCRUB_GPU")!=nullptr) {
+		// https://github.com/tensorflow/tensorflow/tree/v2.4.1/tensorflow/lite/delegates/gpu
+		TfLiteGpuDelegateOptionsV2 opts = {0};
+		opts.is_precision_loss_allowed = 1;
+		auto *gpu_delegate = TfLiteGpuDelegateV2Create(&opts);
+		if (ctx.interpreter->ModifyGraphWithDelegate(gpu_delegate) != kTfLiteOk) {
+			_dbg(ctx, "error: unable to add GPU delegate to interpreter\n");
+			bs_maskgen_delete(pctx);
+			return nullptr;
+		}
+	} else {
+		// Allocate tensor buffers.
+		if (ctx.interpreter->AllocateTensors() != kTfLiteOk) {
+			_dbg(ctx, "error: unable to allocate tensor buffers\n");
+			bs_maskgen_delete(pctx);
+			return nullptr;
+		}
 	}
 
 	// set interpreter params

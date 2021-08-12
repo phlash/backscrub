@@ -41,6 +41,10 @@ endif(TF_CHECKOUT)
 # of weak/strong symbol linking fails in a static library)
 add_compile_definitions(TFLITE_BUILD_WITH_XNNPACK_DELEGATE)
 
+# Enable GPU delegate build, supporting OpenCL/OpenGl/Vulkan APIs
+option(TFLITE_ENABLE_GPU "Enable GPU" ON)
+add_compile_definitions(CL_TARGET_OPENCL_VERSION=200)
+
 # Stop broken xnnpack/FP16 cmake goop from downloading PSimd to our source folder!
 # TODO: check once tensorflow is updated post 2.5.0
 set(CONFU_DEPENDENCIES_SOURCE_DIR ${CMAKE_BINARY_DIR})
